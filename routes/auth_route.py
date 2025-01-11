@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from crud.user_crud import (
     create_user,
@@ -8,10 +8,10 @@ from crud.user_crud import (
     update_user_refresh_token,
 )
 from dependencies import get_session
-from models.token import Token, TokenCreate
+from models.token import Token, TokenBlacklist, TokenCreate
 from models.user import User, UserCreate, UserLogin, UserPublic
 from utils.password import verify_password
-from utils.token import create_access_token, create_refresh_token, verify_refresh_token
+from utils.token import create_access_token, create_refresh_token, verify_token
 
 router = APIRouter(
     tags=["Authentications"],
@@ -54,14 +54,29 @@ async def user_register(payload: UserCreate, session: Session = Depends(get_sess
     },
 )
 async def user_login(data: UserLogin, session: Session = Depends(get_session)) -> Token:
-
+    # Check if user exists and password is correct
     existing_user: User | None = get_user_by_email(session, data.email)
     if not existing_user or not verify_password(data.password, existing_user.password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
-
-    if not verify_refresh_token(existing_user.refresh_token):
+    # If user does not have a refresh token, create one
+    if not existing_user.refresh_token:
+        access_token: str = create_access_token({"sub": existing_user.email})
+        refresh_token: str = create_refresh_token({"sub": existing_user.email})
+        success = update_user_refresh_token(session, existing_user.id, refresh_token)
+        if not success:
+            raise HTTPException(
+                status_code=400, detail="Failed to update refresh token"
+            )
+        access_token: str = create_access_token({"sub": existing_user.email})
+        return Token(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            token_type="bearer",
+        )
+    # If user has a refresh token, verify it
+    if not verify_token(existing_user.refresh_token):
         access_token: str = create_access_token({"sub": existing_user.email})
         refresh_token: str = create_refresh_token({"sub": existing_user.email})
         success = update_user_refresh_token(session, existing_user.id, refresh_token)
@@ -86,14 +101,22 @@ async def user_login(data: UserLogin, session: Session = Depends(get_session)) -
 async def create_token(
     payload: TokenCreate, session: Session = Depends(get_session)
 ) -> Token:
-    user = verify_refresh_token(payload.refresh_token)
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid refresh token")
+    # Verify refresh token
+    user = verify_token(payload.refresh_token)
+    # Check if token is blacklisted
+    token_blacklisted = session.exec(
+        select(TokenBlacklist).where(TokenBlacklist.token == payload.refresh_token)
+    ).first()
+    if token_blacklisted:
+        raise HTTPException(status_code=400, detail="Token has been blacklisted")
 
     access_token: str = create_access_token({"sub": user.email})
     refresh_token: str = create_refresh_token({"sub": user.email})
-
     success = update_user_refresh_token(session, user.id, refresh_token)
+    # Blacklist old refresh token
+    token_blacklist = TokenBlacklist(token=payload.refresh_token)
+    session.add(token_blacklist)
+    session.commit()
     if not success:
         raise HTTPException(status_code=400, detail="Failed to update refresh token")
 

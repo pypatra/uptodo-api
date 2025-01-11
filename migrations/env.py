@@ -8,6 +8,7 @@ from sqlalchemy import pool
 from sqlmodel import SQLModel
 from models.todo import Todo
 from models.user import User
+from models.token import TokenBlacklist
 
 from alembic import context
 
